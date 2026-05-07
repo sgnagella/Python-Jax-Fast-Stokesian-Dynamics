@@ -1,15 +1,15 @@
 import freud
+import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.lib import xla_bridge
 from jfsd import main
-import pytest 
+import pytest
 
 def jax_has_gpu():
     """Check that the machine in use has an available GPU for jax.
 
     """
-    return (xla_bridge.get_backend().platform)
+    return jax.default_backend()
 
 class TestClass:
     

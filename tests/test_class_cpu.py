@@ -1,14 +1,14 @@
+import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.lib import xla_bridge
 from jfsd import main
-import pytest 
+import pytest
 
 def jax_has_cpu():
     """Check that jax is running on CPU.
 
     """
-    return (xla_bridge.get_backend().platform)
+    return jax.default_backend()
     
 class TestClassCPU:
     

@@ -5,9 +5,8 @@ import scipy.sparse as sp
 
 import jax.numpy as jnp
 import numpy as np
+import jax
 from jax import Array, jit, random
-from jax.config import config
-from jax.lib import xla_bridge
 from jax.typing import ArrayLike
 
 from tqdm import tqdm
@@ -15,7 +14,7 @@ from tqdm import tqdm
 from jfsd import applied_forces, mobility, resistance, shear, solver, thermal, utils
 from jfsd import jaxmd_space as space
 
-config.update("jax_enable_x64", False)  # Disable double precision by default
+jax.config.update("jax_enable_x64", False)  # Disable double precision by default
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"  # Avoid JAX preallocating most GPU memory
 
 def main(
@@ -145,9 +144,9 @@ def main(
                 "Select 'brownian' instead."
             )
         lx = ly = lz = 999999  # Effectively infinite box size.
-        config.update("jax_enable_x64", True)  # Enable double precision for long-range interactions.
-    
-    print("jfsd is running on device:", xla_bridge.get_backend().platform)
+        jax.config.update("jax_enable_x64", True)  # Enable double precision for long-range interactions.
+
+    print("jfsd is running on device:", jax.default_backend())
     
     if hydrodynamic_interaction_flag == 0:
         trajectory, velocities = wrap_bd(
