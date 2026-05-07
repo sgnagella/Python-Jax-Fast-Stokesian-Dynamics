@@ -149,3 +149,5 @@ docs/source/images/.$distributions.drawio.bkp
 
 # Sphinx
 docs/build
+output_rigid_dumbbell/trajectory.npy
+output_rigid_dumbbell/velocities.npy
