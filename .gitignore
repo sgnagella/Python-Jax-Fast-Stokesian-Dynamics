@@ -151,3 +151,4 @@ docs/source/images/.$distributions.drawio.bkp
 docs/build
 output_rigid_dumbbell/trajectory.npy
 output_rigid_dumbbell/velocities.npy
+output_rigid_dumbbell/out_KT_1.0_alpha_-10.0_.gsd

@@ -23,7 +23,7 @@ from rigid_sd.solver_rigid import solve_linear_system_rigid
 
 jax.config.update("jax_enable_x64", False)
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # suppress JAX/TF debug logging
 
 # ── Hard-sphere force (inter-body pairs only) ─────────────────────────────────
 
@@ -43,7 +43,8 @@ def _compute_hs_forces(
     Effective diameter: σ = 2.002 (0.1% shift).
     """
     sigma = 2.002
-    k = 2500.839791 / dt
+    # k = 2500.839791 / dt
+    k = 1/dt # for RPY level HIs
 
     # Displacement vectors for all lubrication pairs
     inv_box = jnp.linalg.inv(box)
@@ -60,6 +61,9 @@ def _compute_hs_forces(
     overlap = dist < sigma
     inter = jnp.array(inter_body_mask, dtype=bool)
     fp_mod = jnp.where(overlap & inter, k * (1.0 - sigma / jnp.where(dist > 0, dist, 1.0)), 0.0)
+    # if jnp.any(fp_mod > 0):
+    #     print(f"  Hard-sphere forces: {jnp.sum(fp_mod > 0)} pairs overlapping (max overlap={jnp.max(sigma - dist):.4f}).")
+    #     exit(1)
 
     # Accumulate onto particles
     forces = jnp.zeros((num_particles, 3))
@@ -196,6 +200,10 @@ def run_rigid_sd(
     seed_nf: int,
     output: str | None = None,
     active_alpha: float = 0.0,
+    trap_particle_ids: np.ndarray | None = None,
+    trap_spring_k: float = 0.0,
+    trap_targets=None,
+    probe_body_id: int | None = None,
 ) -> tuple[Array, Array]:
     """Run rigid-body SD and return (trajectory, velocities).
 
@@ -203,8 +211,15 @@ def run_rigid_sd(
     ----------
     assembly_ids : (N_p,) int array — assembly_ids[i] = index of rigid body for particle i.
     active_alpha : activity strength for the body-frame squirmer stresslet
-        S_active = alpha*(d⊗d − I/3) placed on the head bead of each body.
+        S_active = alpha*(d⊗d − I/3) placed on the head bead of each multi-bead body.
         alpha > 0 → pusher, alpha < 0 → puller, alpha = 0 → passive (default).
+    trap_particle_ids : (N_trap,) int array of particle indices subject to harmonic traps.
+    trap_spring_k : spring constant for all harmonic traps.
+    trap_targets : callable(step, dt) → jnp.ndarray (N_trap, 3) of trap centre positions.
+        Called each step at Python level (not inside JIT).
+    probe_body_id : rigid-body index whose orientation to track. If given, the unit vector
+        initialized to (1, 0, 0) is rotated each step by the body's angular velocity using
+        the Rodrigues formula and saved to probe_orientation.npy in the output directory.
     All other parameters mirror wrap_sd() in jfsd/main.py.
     """
     if writing_period > num_steps:
@@ -219,6 +234,11 @@ def run_rigid_sd(
     n_frames = int(num_steps / writing_period)
     trajectory = np.zeros((n_frames, num_particles, 3), float)
     velocities = np.zeros((n_frames, num_particles, 6), float)
+
+    track_orientation = probe_body_id is not None
+    if track_orientation:
+        probe_orient = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        orientations = np.zeros((n_frames, 3), dtype=np.float64)
 
     epsilon = error_tolerance
     xy = 0.0
@@ -235,9 +255,11 @@ def run_rigid_sd(
     update_positions = _make_position_updater(shift_fn, box, num_particles)
     update_rigid_positions = _make_rigid_position_updater(assembly_ids, num_bodies, lx, ly, lz)
 
-    # Tail = first bead of each body; head = second bead (tail→head bond direction).
-    tail_idx = np.array([np.where(assembly_ids == b)[0][0] for b in range(num_bodies)])
-    head_idx = np.array([np.where(assembly_ids == b)[0][1] for b in range(num_bodies)])
+    # Multi-bead bodies only — single-bead bodies have no head/tail distinction.
+    bead_count = np.array([np.sum(assembly_ids == b) for b in range(num_bodies)])
+    multi_bead_bodies = np.where(bead_count >= 2)[0]
+    tail_idx = np.array([np.where(assembly_ids == b)[0][0] for b in multi_bead_bodies])
+    head_idx = np.array([np.where(assembly_ids == b)[0][1] for b in multi_bead_bodies])
 
     unique_pairs, nl_ff, nl_lub, nl_prec, _ = utils.cpu_nlist(
         positions, np.array([lx, ly, lz]), ewald_cut, 3.99, 2.1, xy
@@ -454,30 +476,36 @@ def run_rigid_sd(
                     raise ValueError(f"Near-field Lanczos did not converge (stepnorm={stepnorm_nf}).")
                 saddle_b = saddle_b.at[11 * num_particles:].add(-(Sigma @ F_B_nf))
 
-        # ── Inter-body hard-sphere forces → particle force slot (b_top[:6N_p]) ──
-        # Consistent with wrap_sd: applied forces go into b[:6N], not b[11N:].
-        # Placing them in b_bot (via Sigma projection) changes the hydrodynamic
-        # coupling and gives wrong velocities once dumbbells make contact.
+        # ── Inter-body hard-sphere forces → b[11·N_p:] via Σ projection ────────
         F_hs = _compute_hs_forces(
             positions, np.array(indices_i_lub), np.array(indices_j_lub),
             mask, box, time_step, num_particles,
         )
-        saddle_b = saddle_b.at[:6 * num_particles].add(F_hs)
+        saddle_b = saddle_b.at[11 * num_particles:].add(-(Sigma @ F_hs))
+
+        # ── Harmonic trap forces → b[11·N_p:] via Σ projection ──────────────
+        if trap_particle_ids is not None and trap_spring_k > 0.0:
+            r_trap_all = trap_targets(step, time_step)            # (N_trap, 3)
+            F_trap_flat = jnp.zeros(6 * num_particles)
+            for ti, pid in enumerate(trap_particle_ids):
+                f = trap_spring_k * (r_trap_all[ti] - positions[pid])
+                F_trap_flat = F_trap_flat.at[6 * int(pid) : 6 * int(pid) + 3].add(f)
+            saddle_b = saddle_b.at[11 * num_particles:].add(-(Sigma @ F_trap_flat))
 
         # ── Active stresslet: S_active = alpha*(d⊗d − I/3) on head bead ─────
         # d is the unit bond vector tail→head, recomputed from current positions.
         # Sign convention matches background shear in jfsd/main.py:871 (add −E).
         if active_alpha != 0.0:
-            for b in range(num_bodies):
-                t_i, h_i = int(tail_idx[b]), int(head_idx[b])
+            for bi, b in enumerate(multi_bead_bodies):
+                t_i, h_i = int(tail_idx[bi]), int(head_idx[bi])
                 d = positions[h_i] - positions[t_i]
                 d = d / jnp.linalg.norm(d)
                 s_flat = active_alpha * jnp.array([
-                    d[0] * d[0] - 1.0 / 3.0,   # E_xx
-                    d[0] * d[1],                 # E_xy  (= E_yx, one slot)
-                    d[0] * d[2],                 # E_xz
-                    d[1] * d[2],                 # E_yz
-                    d[1] * d[1] - 1.0 / 3.0,   # E_yy
+                    2.0*d[0]*d[0] + d[1]*d[1] - 1.0,   # 2·S_xx + S_yy
+                    2.0*d[0]*d[1],                        # 2·S_xy
+                    2.0*d[0]*d[2],                        # 2·S_xz
+                    2.0*d[1]*d[2],                        # 2·S_yz
+                    d[0]*d[0] + 2.0*d[1]*d[1] - 1.0,   # S_xx + 2·S_yy
                 ])
                 base = 6 * num_particles + 5 * h_i
                 saddle_b = saddle_b.at[base : base + 5].add(-s_flat)
@@ -502,6 +530,27 @@ def run_rigid_sd(
 
         # U_particles from V_rb_total — used only for velocity output.
         U_particles = K @ V_rb_total                            # (6·N_p,)
+
+        # ── Probe orientation update (Rodrigues rotation) ─────────────────────
+        # jfsd's angular velocity convention is the NEGATIVE of the standard
+        # right-hand vorticity: Ω_jfsd = −(1/2)∇×U.  Negate to recover the
+        # physical angular velocity before integrating the orientation vector.
+        if track_orientation:
+            Omega_probe = -np.array(
+                V_rb_total[6 * probe_body_id + 3 : 6 * probe_body_id + 6], dtype=np.float64
+            )
+            omega_norm = np.linalg.norm(Omega_probe)
+            if omega_norm > 1e-10:
+                theta = omega_norm * time_step
+                n = Omega_probe / omega_norm
+                sin_t, cos_t = np.sin(theta), np.cos(theta)
+                K_skew = np.array([
+                    [0.0,   -n[2],  n[1]],
+                    [n[2],   0.0,  -n[0]],
+                    [-n[1],  n[0],  0.0],
+                ])
+                R = cos_t * np.eye(3) + sin_t * K_skew + (1.0 - cos_t) * np.outer(n, n)
+                probe_orient = R @ probe_orient
 
         if jnp.any(jnp.isnan(positions)) or jnp.any(jnp.isinf(positions)):
             raise ValueError(f"Invalid positions at step {step}.")
@@ -530,8 +579,12 @@ def run_rigid_sd(
             frame = step // writing_period
             trajectory[frame] = positions
             velocities[frame] = jnp.reshape(U_particles, (num_particles, 6))
+            if track_orientation:
+                orientations[frame] = probe_orient
             if out_path is not None:
                 np.save(out_path / "trajectory.npy", trajectory)
                 np.save(out_path / "velocities.npy", velocities)
+                if track_orientation:
+                    np.save(out_path / "probe_orientation.npy", orientations)
 
     return jnp.array(trajectory), jnp.array(velocities)

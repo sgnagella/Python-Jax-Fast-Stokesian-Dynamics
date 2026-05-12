@@ -170,3 +170,201 @@ Converts jfsd `.npy` trajectory files to GSD format (HOOMD/OVITO).  Supports
 per-frame positions, linear velocities, angular velocities (stored as a GSD log
 entry `"particles/angular_velocity"` readable by OVITO), and optional assembly-id
 colouring (each rigid body gets a distinct particle type `"body0"`, `"body1"`, …).
+
+---
+
+## 2026-05-08 — Active-stresslet bug fix; probe simulation toolchain
+
+### Bug fix: active stresslet used wrong slot encoding (`main_rigid.py`)
+
+**Symptom**: pusher/puller swimmers produced incorrect self-propulsion speeds
+because the five stresslet components were placed in the wrong positions in the
+RHS vector.
+
+**Root cause**: the five stresslet slots in the saddle-point RHS follow the
+compressed linear-combination convention established in `jfsd/mobility.py`
+(lines 2328–2338):
+
+| Slot | Meaning |
+|------|---------|
+| 0 | 2·S_xx + S_yy |
+| 1 | 2·S_xy |
+| 2 | 2·S_xz |
+| 3 | 2·S_yz |
+| 4 | S_xx + 2·S_yy |
+
+The active-stresslet code was writing the raw symmetric components
+(S_xx, S_xy, S_xz, S_yz, S_yy) directly into those slots — wrong for all
+five components in general.
+
+**Fix (`main_rigid.py`)**: the `s_flat` array now applies the correct linear
+combinations directly.  For S = α·(d⊗d − I/3) with unit bond vector **d**:
+
+```
+slot 0 = α·(2·dx² + dy² − 1)   # = 2·S_xx + S_yy
+slot 1 = 2·α·dx·dy              # = 2·S_xy
+slot 2 = 2·α·dx·dz              # = 2·S_xz
+slot 3 = 2·α·dy·dz              # = 2·S_yz
+slot 4 = α·(dx² + 2·dy² − 1)   # = S_xx + 2·S_yy
+```
+
+The slot placement (`base = 6·N_p + 5·h_i`) and sign (`add(-s_flat)`) were
+already correct.
+
+---
+
+### New file: `init_probe_dumbbells.py`
+
+Standalone initial-condition generator for probe-microrheology systems.
+
+**Library function `initialize()`**
+
+| Parameter | Description |
+|-----------|-------------|
+| `probe_separation` | Centre-to-centre distance between the two probe colloids |
+| `n_dumbbells` | Number of rigid dumbbell swimmers |
+| `number_density` | Dumbbell number density ρ = N/L³ — derives the cubic box side L |
+| `bond_length` | Bead c-to-c distance within each dumbbell (default 2.001) |
+| `surface_gap` | Minimum surface-to-surface clearance for rejection sampling (default 0.1) |
+| `seed` | NumPy RNG seed for reproducibility |
+
+Swimmer COMs are drawn uniformly from [−L/2, L/2]³; bond axes are random unit
+vectors.  Rejection sampling (minimum-image distances) enforces `surface_gap`
+between all inter-body bead pairs.  A `validate()` helper re-checks the full
+configuration after placement.
+
+Returns a dict: `positions` (N_p × 3), `assembly_ids` (N_p,), `type_labels`
+(N_p,), box dimensions, and metadata.
+
+**`write_initial_gsd(cfg, path)`** writes a single-frame GSD of the generated
+configuration for immediate OVITO inspection.
+
+**CLI**
+
+```
+python rigid_sd/init_probe_dumbbells.py \
+    --probe-separation 2.8 --n-dumbbells 20 --number-density 0.01 \
+    --seed 42 --output init.npz --gsd init.gsd
+```
+
+Guards: raises `ValueError` if the box implied by `number_density` is too small
+to contain the probe pair; warns to stderr if volume fraction φ > 0.30.
+
+---
+
+### Updated: `run_probe.py`
+
+Expanded from 2 to 5 active dumbbell swimmers.  The fixed placement block
+(hardcoded offsets above/below the probe pair in the xy-plane) is replaced
+by the same 3-D rejection-sampling logic now factored into
+`init_probe_dumbbells.py`: random COM distances 4.5–10 σ from the probe-pair
+midpoint, random bond orientations, minimum inter-body gap 2.5 σ.  A fixed
+seed (`POSITION_SEED = 42`) keeps the run reproducible.
+
+---
+
+### New file: `run_probe_cli.py`
+
+CLI-driven copy of `run_probe.py`.  All parameters are command-line arguments;
+the initial configuration is supplied in one of two ways:
+
+```
+# Load from a pre-generated .npz
+python rigid_sd/run_probe_cli.py --init init.npz \
+    --kT 1.0 --active-alpha -2.0 --num-steps 5000 -o output_probe
+
+# Generate inline (same parameters as init_probe_dumbbells.py)
+python rigid_sd/run_probe_cli.py \
+    --probe-separation 2.8 --n-dumbbells 10 --number-density 0.01 \
+    --kT 1.0 --active-alpha 2.0
+```
+
+Simulation flags: `--kT`, `--active-alpha`, `--num-steps`, `--dt`,
+`--writing-period`, `--trap-k`, `--trap-omega`, `--ewald-xi`, `--error-tol`,
+`--max-strain`, four `--seed-*` flags, and `--output`.  When `--init` is
+absent all three of `--probe-separation`, `--n-dumbbells`, and
+`--number-density` are required.
+
+Typical two-step workflow:
+
+```
+# Step 1 — place and inspect
+python rigid_sd/init_probe_dumbbells.py \
+    --probe-separation 2.8 --n-dumbbells 20 --number-density 0.01 \
+    --output init.npz --gsd init.gsd
+
+# Step 2 — run (reuse exact same geometry, vary physics)
+python rigid_sd/run_probe_cli.py --init init.npz \
+    --kT 1.0 --active-alpha -2.0 --num-steps 5000
+```
+
+---
+
+### Updated: `make_gsd.py` — `--init-gsd` template flag
+
+`write_gsd()` gains an optional `init_gsd` parameter.  When provided, frame 0
+of that GSD file is read and supplies the box dimensions (`lx`, `ly`, `lz`,
+`xy`), particle type names, per-particle type IDs, and per-particle diameters.
+All of `lx/ly/lz/xy`, `particle_radius`, `type_labels`, and `assembly_ids` are
+then ignored.  A `ValueError` is raised on particle-count mismatch.
+
+`lx`, `ly`, `lz` are now optional keyword arguments (were previously positional
+required); existing keyword-argument callers are unaffected.
+
+CLI: `--lx/--ly/--lz` are now optional; `p.error()` is called if neither
+`--init-gsd` nor all three box flags are present.
+
+Post-simulation usage:
+
+```
+python rigid_sd/make_gsd.py output_probe/trajectory.npy run.gsd \
+    --init-gsd init.gsd \
+    --velocities output_probe/velocities.npy \
+    --period 10
+```
+
+---
+
+## 2026-05-11 — Probe orientation tracking and sphere visualization
+
+### Feature: probe orientation trajectory (`main_rigid.py`)
+
+`run_rigid_sd` gains an optional `probe_body_id: int | None = None` parameter.
+When set, the unit orientation vector of that rigid body is tracked throughout
+the simulation and saved to `probe_orientation.npy` in the output directory.
+
+**Implementation details:**
+
+- The vector is initialized to **(1, 0, 0)** in Cartesian coordinates.
+- Each timestep the angular velocity of body `probe_body_id` is extracted from
+  `V_rb_total[6·probe_body_id+3 : 6·probe_body_id+6]` and used to rotate the
+  orientation vector via the same **Rodrigues formula** already used for the
+  position update — exact to floating-point precision, no drift.
+- The result is written to `probe_orientation.npy` (shape `n_frames × 3`) at
+  the same cadence as `trajectory.npy` and `velocities.npy`.
+- `run_probe.py` and `run_probe_cli.py` both pass `probe_body_id=0` (the
+  centre probe colloid); `run_dumbbell.py` is unchanged (defaults to `None`).
+
+### New file: `visualize_probe_orientation.py`
+
+Post-processing script that renders the orientation trajectory on a unit sphere.
+
+```
+python rigid_sd/visualize_probe_orientation.py output_probe/probe_orientation.npy
+python rigid_sd/visualize_probe_orientation.py output_probe/probe_orientation.npy \
+    -o probe_orientation.png --stride 5 --elev 25 --azim -45
+```
+
+**Visual elements:**
+
+| Element | Description |
+|---------|-------------|
+| Transparent sphere | Unit sphere with faint latitude/longitude grid |
+| Colored path | Orientation vector tip trajectory, colored by normalised time (viridis) |
+| Green dot/arrow | Start point (1, 0, 0) and vector from origin |
+| Red dot/arrow | End point and vector from origin |
+| Colorbar | Normalised time axis (t = 0 → t = T) |
+| Axis arrows | Faint Cartesian reference frame |
+
+CLI flags: `--stride` (frame decimation), `--cmap`, `--elev`, `--azim`,
+`--lw` (line width), `--title`, `--dpi`, `--output`.

@@ -22,7 +22,7 @@ N_BODIES      = N_DUMBBELLS
 
 LX = LY = LZ  = 30.0
 # KT            = 0.005305165  # 1/(6π) → Brownian time = 60π
-KT            = 1.0           # higher temperature for more visible diffusion in short runs
+KT            = 0.0           # higher temperature for more visible diffusion in short runs
 ACTIVE_ALPHA  = -10.0           # activity: >0 pusher, <0 puller, 0 passive
 EWALD_XI      = 0.5
 ERROR_TOL     = 0.001
