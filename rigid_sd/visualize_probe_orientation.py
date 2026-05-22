@@ -112,7 +112,7 @@ def main(argv=None) -> None:
     
     # ── Figure ────────────────────────────────────────────────────────────
     fig = plt.figure(figsize=(8, 7))
-    ax = fig.add_subplot(111, projection="3d")
+    ax = fig.add_subplot(111, projection="3d", )
     ax.view_init(elev=args.elev, azim=args.azim)
 
     _draw_sphere(ax)

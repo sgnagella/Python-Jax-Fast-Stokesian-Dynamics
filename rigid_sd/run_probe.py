@@ -159,6 +159,7 @@ trajectory, velocities = run_rigid_sd(
     trap_spring_k   = TRAP_K,
     trap_targets    = trap_targets_fn,
     probe_body_id   = 0,
+    trap_v_char     = SEPARATION * TRAP_OMEGA,
 )
 
 # ── Validation ────────────────────────────────────────────────────────────────

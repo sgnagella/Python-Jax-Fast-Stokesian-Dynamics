@@ -33,18 +33,20 @@ def _compute_hs_forces(
     indices_j: np.ndarray,
     inter_body_mask: np.ndarray,
     box: ArrayLike,
-    dt: float,
+    k_hs: float,
     num_particles: int,
 ) -> Array:
     """Repulsive harmonic hard-sphere forces between inter-body pairs.
 
     Returns a (6·N_p,) flat force vector [Fx, Fy, Fz, 0, 0, 0, ...].
-    Spring constant from applied_forces.py SD mode: k = 2500.839791 / dt.
     Effective diameter: σ = 2.002 (0.1% shift).
+
+    k_hs must be passed explicitly; see run_rigid_sd for the scaling formula.
+    The equilibrium overlap at driving velocity v is δ_eq = v / (k_hs * M_rel),
+    where M_rel ≈ 0.25 * M_self ≈ 0.013 for RPY at contact.
     """
     sigma = 2.002
-    # k = 2500.839791 / dt
-    k = 1/dt # for RPY level HIs
+    k = k_hs
 
     # Displacement vectors for all lubrication pairs
     inv_box = jnp.linalg.inv(box)
@@ -204,6 +206,8 @@ def run_rigid_sd(
     trap_spring_k: float = 0.0,
     trap_targets=None,
     probe_body_id: int | None = None,
+    k_hs: float | None = None,
+    trap_v_char: float = 0.0,
 ) -> tuple[Array, Array]:
     """Run rigid-body SD and return (trajectory, velocities).
 
@@ -220,6 +224,12 @@ def run_rigid_sd(
     probe_body_id : rigid-body index whose orientation to track. If given, the unit vector
         initialized to (1, 0, 0) is rotated each step by the body's angular velocity using
         the Rodrigues formula and saved to probe_orientation.npy in the output directory.
+    k_hs : hard-sphere spring constant. If None (default), auto-computed as
+        max(v_thermal, v_active, v_trap) / dt  (see trap_v_char below).
+        Pass an explicit value to override entirely.
+    trap_v_char : characteristic trap velocity = probe_separation * omega (the orbital
+        speed of the moving trap centre).  Used as v_trap in the k_hs formula.
+        Default 0 (no trap driving contribution).
     All other parameters mirror wrap_sd() in jfsd/main.py.
     """
     if writing_period > num_steps:
@@ -283,6 +293,26 @@ def run_rigid_sd(
 
     n_iter_ff = 2
     n_iter_nf = 2
+
+    # ── Hard-sphere spring constant ───────────────────────────────────────────
+    # k_hs = Pe_char / dt,  Pe_char = max(v_thermal, v_active, v_trap).
+    # v_thermal = 1 (conventional; active only when kT > 0).
+    # v_active  = |alpha| * M_self  (swim-speed scale from stresslet driving).
+    # v_trap    = trap_v_char = probe_separation * omega  (orbital speed of trap).
+    # Purely thermal:  Pe_char = 1  →  k_hs = 1/dt  (unchanged from before).
+    # Driven runs:     Pe_char > 1  →  k_hs scales with the Péclet number.
+    sigma_hs = 2.0 * particle_radius * 1.001
+    if k_hs is None:
+        pad_factor = 1.5
+        m_tt     = float(m_self[0])
+        v_thermal = 1.0 if temperature > 0 else 0.0
+        v_active  = abs(active_alpha) * 2.001 # v_act ~ alpha * dipole_length * fudge factor (head-tail separation)
+        Pe_char   = max(v_thermal, v_active, trap_v_char)
+        print(f"  v_thermal = {v_thermal:.4g}, v_active = {v_active:.4g}, trap_v_char = {trap_v_char:.4g}")
+        _k_hs     = (Pe_char / time_step) * pad_factor
+    else:
+        _k_hs = k_hs
+    print(f"  k_hs = {_k_hs:.4g}  (Pe_char = {_k_hs * time_step / pad_factor:.4g})")
 
     print("jfsd-rigid running on:", jax.default_backend())
     print("Starting: compiling (first step may take ~1-2 min)…")
@@ -479,7 +509,7 @@ def run_rigid_sd(
         # ── Inter-body hard-sphere forces → b[11·N_p:] via Σ projection ────────
         F_hs = _compute_hs_forces(
             positions, np.array(indices_i_lub), np.array(indices_j_lub),
-            mask, box, time_step, num_particles,
+            mask, box, _k_hs, num_particles,
         )
         saddle_b = saddle_b.at[11 * num_particles:].add(-(Sigma @ F_hs))
 
@@ -560,10 +590,14 @@ def run_rigid_sd(
             num_particles, positions, ewald_cut, 3.99, 2.1, unique_pairs, box,
         )
         if not within_bounds:
-            print("Re-allocating neighbor list…")
+            # print("Re-allocating neighbor list…")
             unique_pairs, nl_ff, nl_lub, nl_prec, _ = utils.cpu_nlist(
                 positions, np.array([lx, ly, lz]), ewald_cut, 3.99, 2.1, xy,
             )
+        
+        # unique_pairs, nl_ff, nl_lub, nl_prec, _ = utils.cpu_nlist(
+        #     positions, np.array([lx, ly, lz]), ewald_cut, 3.99, 2.1, xy,
+        # )
         gaussian_grid_spacing = utils.precompute_grid_distancing(
             gauss_support, gridh[0], xy, positions,
             num_particles, grid_x, grid_y, grid_z, lx, ly, lz,

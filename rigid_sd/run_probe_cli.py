@@ -200,6 +200,7 @@ def main(argv=None) -> None:
 
     # ── Trap ──────────────────────────────────────────────────────────────
     trap_targets_fn = _make_trap_targets(probe_separation, args.trap_omega)
+    trap_v_char = probe_separation * args.trap_omega
 
     # ── Echo run parameters ───────────────────────────────────────────────
     print(f"\nProbe microrheology: {n_colloids} colloids + {n_dumbbells} dumbbell swimmers")
@@ -233,6 +234,7 @@ def main(argv=None) -> None:
         trap_spring_k     = args.trap_k,
         trap_targets      = trap_targets_fn,
         probe_body_id     = 0,
+        trap_v_char       = trap_v_char,
     )
 
     # ── Validation ────────────────────────────────────────────────────────

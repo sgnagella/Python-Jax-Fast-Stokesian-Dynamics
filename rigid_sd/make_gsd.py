@@ -8,6 +8,11 @@ Usage — standalone (box + type info supplied explicitly)
         --velocities output_rigid_dumbbell/velocities.npy \
         --assembly-ids assembly_ids.npy
 
+    # type labels from a .npy file (shape (N,), string dtype):
+    python rigid_sd/make_gsd.py output_rigid_dumbbell/trajectory.npy out.gsd \
+        --lx 30 --ly 30 --lz 30 \
+        --type-labels-file labels.npy
+
 Usage — with initial GSD template (box + particle info loaded automatically)
 ----------------------------------------------------------------------------
     python rigid_sd/make_gsd.py output_probe/trajectory.npy out.gsd \
@@ -181,6 +186,12 @@ def main() -> None:
         help="Per-particle type labels (space-separated).  E.g. A A C B C B.  "
              "Overrides --assembly-ids.",
     )
+    p.add_argument(
+        "--type-labels-file", default=None, metavar="FILE",
+        help="Path to a .npy file containing per-particle type labels (shape (N,), "
+             "string dtype).  Overrides --assembly-ids.  Ignored if --type-labels "
+             "is also supplied.",
+    )
     args = p.parse_args()
 
     # Validate: must have either --init-gsd or all three box dimensions.
@@ -188,9 +199,14 @@ def main() -> None:
         p.error("supply either --init-gsd FILE or all of --lx, --ly, --lz.")
 
     trajectory   = np.load(args.trajectory)
-    velocities   = np.load(args.velocities)   if args.velocities   else None
-    assembly_ids = np.load(args.assembly_ids) if args.assembly_ids else None
-    type_labels  = np.array(args.type_labels) if args.type_labels  else None
+    velocities   = np.load(args.velocities)        if args.velocities        else None
+    assembly_ids = np.load(args.assembly_ids)      if args.assembly_ids      else None
+    if args.type_labels:
+        type_labels = np.array(args.type_labels)
+    elif args.type_labels_file:
+        type_labels = np.load(args.type_labels_file, allow_pickle=True).astype(str)
+    else:
+        type_labels = None
 
     write_gsd(
         trajectory    = trajectory,
