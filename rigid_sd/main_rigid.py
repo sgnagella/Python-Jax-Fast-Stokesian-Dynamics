@@ -18,7 +18,12 @@ from tqdm import tqdm
 
 from jfsd import thermal, utils
 from jfsd import jaxmd_space as space
-from rigid_sd.assembly import build_kinematic_map, get_inter_body_mask
+from rigid_sd.assembly import (
+    compute_relative_positions,
+    apply_K,
+    apply_Sigma,
+    get_inter_body_mask,
+)
 from rigid_sd.solver_rigid import solve_linear_system_rigid
 
 jax.config.update("jax_enable_x64", False)
@@ -319,8 +324,8 @@ def run_rigid_sd(
 
     for step in tqdm(range(num_steps), mininterval=0.5):
 
-        # ── Build rigid-body kinematics ───────────────────────────────────────
-        K, Sigma = build_kinematic_map(positions, assembly_ids, num_bodies)
+        # ── Relative positions for matrix-free K / Σ ─────────────────────────
+        _, s_rb = compute_relative_positions(positions, assembly_ids, num_bodies)
 
         # ── Precompute pair quantities ────────────────────────────────────────
         precomputed = utils.precompute(
@@ -370,7 +375,7 @@ def run_rigid_sd(
             random_rb = -((2 * random_rb - 1) * jnp.sqrt(3))
 
             # Particle displacements from rigid-body random velocities
-            dU_p = K @ random_rb                                 # (6·N_p,)
+            dU_p = apply_K(random_rb, s_rb, assembly_ids)       # (6·N_p,)
             dU_p_pos = jnp.reshape(dU_p, (num_particles, 6))
 
             # Positive perturbation
@@ -393,14 +398,14 @@ def run_rigid_sd(
             buf_mask = get_inter_body_mask(assembly_ids, buf_precomp[16], buf_precomp[17])
             buf_jmask = jnp.array(buf_mask, dtype=jnp.float32)
             buf_inter_res = tuple(f * buf_jmask for f in buf_precomp[18][:11])
-            K_buf, Sigma_buf = build_kinematic_map(buf_pos, assembly_ids, num_bodies)
+            _, s_buf = compute_relative_positions(buf_pos, assembly_ids, num_bodies)
 
             rfd_b_pos = jnp.zeros(sys_size).at[11 * num_particles:].set(random_rb)
             x_pos, _ = solve_linear_system_rigid(
                 num_particles, num_bodies, rfd_b_pos,
                 gridk, buf_precomp,
                 int(grid_x), int(grid_y), int(grid_z), int(gauss_support), m_self,
-                K_buf, Sigma_buf, buf_inter_res,
+                s_buf, assembly_ids, buf_inter_res,
             )
 
             # Negative perturbation
@@ -423,14 +428,14 @@ def run_rigid_sd(
             buf_mask_neg = get_inter_body_mask(assembly_ids, buf_precomp_neg[16], buf_precomp_neg[17])
             buf_jmask_neg = jnp.array(buf_mask_neg, dtype=jnp.float32)
             buf_inter_res_neg = tuple(f * buf_jmask_neg for f in buf_precomp_neg[18][:11])
-            K_buf_neg, Sigma_buf_neg = build_kinematic_map(buf_neg, assembly_ids, num_bodies)
+            _, s_buf_neg = compute_relative_positions(buf_neg, assembly_ids, num_bodies)
 
             rfd_b_neg = jnp.zeros(sys_size).at[11 * num_particles:].set(random_rb)
             x_neg, _ = solve_linear_system_rigid(
                 num_particles, num_bodies, rfd_b_neg,
                 gridk, buf_precomp_neg,
                 int(grid_x), int(grid_y), int(grid_z), int(gauss_support), m_self,
-                K_buf_neg, Sigma_buf_neg, buf_inter_res_neg,
+                s_buf_neg, assembly_ids, buf_inter_res_neg,
             )
 
             V_rb_pos = x_pos[11 * num_particles:]
@@ -504,14 +509,18 @@ def run_rigid_sd(
                     )
                 if not math.isfinite(stepnorm_nf) or (n_iter_nf > 250 and stepnorm_nf > 1e-3):
                     raise ValueError(f"Near-field Lanczos did not converge (stepnorm={stepnorm_nf}).")
-                saddle_b = saddle_b.at[11 * num_particles:].add(-(Sigma @ F_B_nf))
+                saddle_b = saddle_b.at[11 * num_particles:].add(
+                    -apply_Sigma(F_B_nf, s_rb, assembly_ids, num_bodies)
+                )
 
         # ── Inter-body hard-sphere forces → b[11·N_p:] via Σ projection ────────
         F_hs = _compute_hs_forces(
             positions, np.array(indices_i_lub), np.array(indices_j_lub),
             mask, box, _k_hs, num_particles,
         )
-        saddle_b = saddle_b.at[11 * num_particles:].add(-(Sigma @ F_hs))
+        saddle_b = saddle_b.at[11 * num_particles:].add(
+            -apply_Sigma(F_hs, s_rb, assembly_ids, num_bodies)
+        )
 
         # ── Harmonic trap forces → b[11·N_p:] via Σ projection ──────────────
         if trap_particle_ids is not None and trap_spring_k > 0.0:
@@ -520,7 +529,9 @@ def run_rigid_sd(
             for ti, pid in enumerate(trap_particle_ids):
                 f = trap_spring_k * (r_trap_all[ti] - positions[pid])
                 F_trap_flat = F_trap_flat.at[6 * int(pid) : 6 * int(pid) + 3].add(f)
-            saddle_b = saddle_b.at[11 * num_particles:].add(-(Sigma @ F_trap_flat))
+            saddle_b = saddle_b.at[11 * num_particles:].add(
+                -apply_Sigma(F_trap_flat, s_rb, assembly_ids, num_bodies)
+            )
 
         # ── Active stresslet: S_active = alpha*(d⊗d − I/3) on head bead ─────
         # d is the unit bond vector tail→head, recomputed from current positions.
@@ -545,7 +556,7 @@ def run_rigid_sd(
             num_particles, num_bodies, saddle_b,
             gridk, precomputed,
             int(grid_x), int(grid_y), int(grid_z), int(gauss_support), m_self,
-            K, Sigma, inter_res,
+            s_rb, assembly_ids, inter_res,
         )
         if exitcode > 0 or not math.isfinite(float(saddle_x[11 * num_particles])):
             raise ValueError(f"GMRES did not converge at step {step} (exitcode={exitcode}).")
@@ -559,7 +570,7 @@ def run_rigid_sd(
         positions = update_rigid_positions(positions, V_rb_total, time_step)
 
         # U_particles from V_rb_total — used only for velocity output.
-        U_particles = K @ V_rb_total                            # (6·N_p,)
+        U_particles = apply_K(V_rb_total, s_rb, assembly_ids)  # (6·N_p,)
 
         # ── Probe orientation update (Rodrigues rotation) ─────────────────────
         # jfsd's angular velocity convention is the NEGATIVE of the standard
